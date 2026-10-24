@@ -1,0 +1,610 @@
+#include <LiquidCrystal.h>
+#include <Keypad.h>
+
+// ======================================================
+// PINES
+// ======================================================
+
+#define ADC_PIN       34
+#define SENSOR_PIN    35
+#define DAC_PIN       25
+
+
+// ======================================================
+// CALIBRACIONES
+// ======================================================
+
+// Conversión experimental del ADC acondicionado a RPM
+const float RPM_POR_VOLTIO = 144.9;
+
+// Offset medido con el motor detenido
+const float OFFSET_ADC = 0.138;
+
+// Relación experimental:
+// RPM = 1.484 * DAC - 35.84
+const float M_DAC = 1.484;
+const float B_DAC = -35.84;
+
+// Rango útil experimental
+const int RPM_MIN = 115;
+const int RPM_MAX = 336;
+
+const int DAC_MIN = 100;
+const int DAC_MAX = 255;
+
+// Corrección proporcional
+const float KP = 0.20;
+
+
+// ======================================================
+// LCD
+// ======================================================
+
+// RS, E, D4, D5, D6, D7
+LiquidCrystal lcd(
+  16,
+  17,
+  18,
+  19,
+  21,
+  22
+);
+
+
+// ======================================================
+// TECLADO 4x4
+// ======================================================
+
+const byte FILAS = 4;
+const byte COLUMNAS = 4;
+
+char teclas[FILAS][COLUMNAS] = {
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+
+byte pinesFilas[FILAS] = {
+  13, 14, 27, 32
+};
+
+byte pinesColumnas[COLUMNAS] = {
+  33, 4, 23, 26
+};
+
+Keypad teclado = Keypad(
+  makeKeymap(teclas),
+  pinesFilas,
+  pinesColumnas,
+  FILAS,
+  COLUMNAS
+);
+
+
+// ======================================================
+// ENCODER
+// ======================================================
+
+volatile unsigned long pulsos = 0;
+volatile unsigned long ultimoPulso = 0;
+
+
+// ======================================================
+// VARIABLES
+// ======================================================
+
+String entrada = "";
+
+int rpmDeseada = 0;
+int dacActual = 0;
+
+float voltajeADC = 0;
+float rpmADC = 0;
+float rpmEncoder = 0;
+
+unsigned long tiempoEncoder = 0;
+unsigned long tiempoControl = 0;
+unsigned long tiempoLCD = 0;
+unsigned long tiempoSerial = 0;
+
+
+// ======================================================
+// INTERRUPCIÓN DEL ENCODER
+// ======================================================
+
+void IRAM_ATTR contarPulso() {
+
+  unsigned long ahora = micros();
+
+  // Filtro contra pulsos falsos por ruido
+  if (ahora - ultimoPulso > 1000) {
+    pulsos++;
+    ultimoPulso = ahora;
+  }
+}
+
+
+// ======================================================
+// LECTURA DEL ADC
+// ======================================================
+
+float leerVoltajeADC() {
+
+  const int muestras = 50;
+  unsigned long suma = 0;
+
+  for (int i = 0; i < muestras; i++) {
+
+    suma += analogReadMilliVolts(ADC_PIN);
+
+    delayMicroseconds(500);
+  }
+
+  return (suma / (float)muestras) / 1000.0;
+}
+
+
+// ======================================================
+// ESCRIBIR UNA LÍNEA LIMPIA EN EL LCD
+// ======================================================
+
+void lineaLCD(byte fila, String texto) {
+
+  while (texto.length() < 16) {
+    texto += " ";
+  }
+
+  if (texto.length() > 16) {
+    texto = texto.substring(0, 16);
+  }
+
+  lcd.setCursor(0, fila);
+  lcd.print(texto);
+}
+
+
+// ======================================================
+// SETUP
+// ======================================================
+
+void setup() {
+
+  Serial.begin(115200);
+
+
+  // ADC
+  analogReadResolution(12);
+
+  analogSetPinAttenuation(
+    ADC_PIN,
+    ADC_11db
+  );
+
+
+  // Encoder
+  pinMode(
+    SENSOR_PIN,
+    INPUT
+  );
+
+  attachInterrupt(
+    digitalPinToInterrupt(SENSOR_PIN),
+    contarPulso,
+    FALLING
+  );
+
+
+  // Motor inicialmente apagado
+  dacWrite(
+    DAC_PIN,
+    0
+  );
+
+
+  // LCD
+  lcd.begin(
+    16,
+    2
+  );
+
+  lineaLCD(
+    0,
+    "CONTROL MOTOR"
+  );
+
+  lineaLCD(
+    1,
+    "Iniciando..."
+  );
+
+  delay(1500);
+
+  lcd.clear();
+
+
+  // Inicialización de tiempos
+  tiempoEncoder = millis();
+  tiempoControl = millis();
+  tiempoLCD = millis();
+  tiempoSerial = millis();
+
+
+  Serial.println("Sistema iniciado");
+  Serial.println("Digite RPM y pulse #");
+  Serial.println("* = borrar");
+  Serial.println("A = detener motor");
+}
+
+
+// ======================================================
+// LOOP PRINCIPAL
+// ======================================================
+
+void loop() {
+
+  unsigned long ahora = millis();
+
+
+  // ====================================================
+  // TECLADO
+  // ====================================================
+
+  char tecla = teclado.getKey();
+
+  if (tecla) {
+
+    // --------------------
+    // Números
+    // --------------------
+
+    if (
+      tecla >= '0' &&
+      tecla <= '9'
+    ) {
+
+      if (
+        entrada.length() < 4
+      ) {
+        entrada += tecla;
+      }
+    }
+
+
+    // --------------------
+    // Borrar
+    // --------------------
+
+    else if (
+      tecla == '*'
+    ) {
+
+      entrada = "";
+    }
+
+
+    // --------------------
+    // Confirmar RPM
+    // --------------------
+
+    else if (
+      tecla == '#'
+    ) {
+
+      if (
+        entrada.length() > 0
+      ) {
+
+        int valor =
+          entrada.toInt();
+
+
+        // Si introduce 0, apaga el motor
+        if (
+          valor == 0
+        ) {
+
+          rpmDeseada = 0;
+          dacActual = 0;
+
+          dacWrite(
+            DAC_PIN,
+            0
+          );
+        }
+
+        else {
+
+          rpmDeseada =
+            constrain(
+              valor,
+              RPM_MIN,
+              RPM_MAX
+            );
+        }
+
+        entrada = "";
+      }
+    }
+
+
+    // --------------------
+    // A = STOP
+    // --------------------
+
+    else if (
+      tecla == 'A'
+    ) {
+
+      rpmDeseada = 0;
+      dacActual = 0;
+      entrada = "";
+
+      dacWrite(
+        DAC_PIN,
+        0
+      );
+    }
+  }
+
+
+  // ====================================================
+  // ADC -> RPM
+  // ====================================================
+
+  voltajeADC =
+    leerVoltajeADC();
+
+
+  // Compensación del offset
+  float voltajeUtil =
+    voltajeADC - OFFSET_ADC;
+
+  if (
+    voltajeUtil < 0
+  ) {
+    voltajeUtil = 0;
+  }
+
+
+  // Conversión voltaje -> RPM
+  float rpmNueva =
+    RPM_POR_VOLTIO *
+    voltajeUtil;
+
+
+  // ====================================================
+  // FILTRO DIGITAL
+  // ====================================================
+
+  static bool primeraLectura = true;
+
+  if (
+    primeraLectura
+  ) {
+
+    rpmADC =
+      rpmNueva;
+
+    primeraLectura =
+      false;
+  }
+
+  else {
+
+    rpmADC =
+      0.25 * rpmNueva +
+      0.75 * rpmADC;
+  }
+
+
+  // Zona muerta para mostrar cero
+  if (
+    rpmADC < 10
+  ) {
+    rpmADC = 0;
+  }
+
+
+  // ====================================================
+  // RPM DIRECTAS DEL ENCODER
+  // SOLO PARA VERIFICACIÓN
+  // ====================================================
+
+  if (
+    ahora - tiempoEncoder >= 1000
+  ) {
+
+    unsigned long dt =
+      ahora - tiempoEncoder;
+
+    tiempoEncoder =
+      ahora;
+
+
+    noInterrupts();
+
+    unsigned long p =
+      pulsos;
+
+    pulsos = 0;
+
+    interrupts();
+
+
+    rpmEncoder =
+      (p * 60000.0) /
+      (36.0 * dt);
+  }
+
+
+  // ====================================================
+  // CONTROL DEL MOTOR
+  // ====================================================
+
+  if (
+    ahora - tiempoControl >= 200
+  ) {
+
+    tiempoControl =
+      ahora;
+
+
+    // --------------------
+    // MOTOR APAGADO
+    // --------------------
+
+    if (
+      rpmDeseada == 0
+    ) {
+
+      dacActual = 0;
+
+      dacWrite(
+        DAC_PIN,
+        0
+      );
+    }
+
+
+    // --------------------
+    // CONTROL DE VELOCIDAD
+    // --------------------
+
+    else {
+
+      // Relación experimental DAC -> RPM
+      float dacBase =
+        (rpmDeseada - B_DAC)
+        / M_DAC;
+
+
+      // Error de velocidad
+      float error =
+        rpmDeseada -
+        rpmADC;
+
+
+      // Corrección proporcional
+      float dacCorregido =
+        dacBase +
+        KP * error;
+
+
+      // Limitar al rango seguro
+      dacActual =
+        constrain(
+          (int)round(dacCorregido),
+          DAC_MIN,
+          DAC_MAX
+        );
+
+
+      // Aplicar DAC
+      dacWrite(
+        DAC_PIN,
+        dacActual
+      );
+    }
+  }
+
+
+  // ====================================================
+  // LCD
+  // ====================================================
+
+  if (
+    ahora - tiempoLCD >= 250
+  ) {
+
+    tiempoLCD =
+      ahora;
+
+
+    // Primera línea
+    String linea1 =
+      "REAL:" +
+      String((int)rpmADC) +
+      " RPM";
+
+    lineaLCD(
+      0,
+      linea1
+    );
+
+
+    // Si se está escribiendo un valor
+    if (
+      entrada.length() > 0
+    ) {
+
+      String linea2 =
+        "SET>" +
+        entrada +
+        " RPM";
+
+      lineaLCD(
+        1,
+        linea2
+      );
+    }
+
+    // RPM ya confirmada
+    else {
+
+      String linea2 =
+        "SET :" +
+        String(rpmDeseada) +
+        " RPM";
+
+      lineaLCD(
+        1,
+        linea2
+      );
+    }
+  }
+
+
+  // ====================================================
+  // MONITOR SERIAL
+  // ====================================================
+
+  if (
+    ahora - tiempoSerial >= 1000
+  ) {
+
+    tiempoSerial =
+      ahora;
+
+
+    float error =
+      rpmDeseada -
+      rpmADC;
+
+
+    Serial.print("SET: ");
+    Serial.print(rpmDeseada);
+
+    Serial.print(" | ADC: ");
+    Serial.print(rpmADC, 1);
+    Serial.print(" RPM");
+
+    Serial.print(" | Encoder: ");
+    Serial.print(rpmEncoder, 1);
+    Serial.print(" RPM");
+
+    Serial.print(" | Vraw: ");
+    Serial.print(voltajeADC, 3);
+    Serial.print(" V");
+
+    Serial.print(" | Vutil: ");
+    Serial.print(voltajeUtil, 3);
+    Serial.print(" V");
+
+    Serial.print(" | DAC: ");
+    Serial.print(dacActual);
+
+    Serial.print(" | Error: ");
+    Serial.println(error, 1);
+  }
+}
